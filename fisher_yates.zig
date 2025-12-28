@@ -28,13 +28,17 @@ fn mainFisher() !void {
     var args = try std.process.argsWithAllocator(allocator);
     defer args.deinit();
     _ = args.skip();
+
     const debug_print: bool = std.mem.eql(u8, "1", args.next() orelse "0");
     const n: u32 = try std.fmt.parseInt(u32, args.next() orelse "5", 10);
     const iterations: u32 = try std.fmt.parseInt(u32, args.next() orelse "10000", 10);
     const Mode = enum { forward, backward, generation };
     const mode: Mode = std.meta.stringToEnum(Mode, args.next() orelse "forward") orelse .forward;
+    const file_prefix = args.next() orelse "out";
+    const ignore_file: bool = std.mem.eql(u8, file_prefix, "ignore");
+
     if (debug_print) {
-        try print(stdout, "n {}, iterations {}, mode {}\r\n", .{ n, iterations, mode });
+        try print(stdout, "n {}, iterations {}, mode {}, file: |{s}|, ignore: {}\r\n", .{ n, iterations, mode, file_prefix, ignore_file });
     }
 
     const seed: u64 = blk: {
@@ -69,29 +73,79 @@ fn mainFisher() !void {
         if (debug_print) {
             try print(stdout, "----------------\n", .{});
         }
+        // just create it the file writer in case.
+        var writer: *std.Io.Writer = stdout;
+        if (!ignore_file) {
+            const file_name = try std.mem.concat(allocator, u8, &[_][]const u8{ file_prefix, "_", @tagName(mode), ".txt" });
+            const file = try std.fs.cwd().createFile(file_name, .{});
+            var f_writer = file.writer(&stdout_buffer);
+            writer = &f_writer.interface;
+        }
         var it = hist.iterator();
         while (it.next()) |entry| {
-            try print(stdout, "{d},{d}\n", .{ entry.key_ptr.*, entry.value_ptr.* });
+            try print(writer, "{d},{d}\n", .{ entry.key_ptr.*, entry.value_ptr.* });
         }
+        writer.flush() catch {};
     } else {
+        var hist: [2]HashMap(Key, u64) = .{ .init(allocator), .init(allocator) };
+        const lists: [2][]u32 = .{ list, try allocator.alloc(u32, list.len) };
         const indices_buffer = try allocator.alloc(usize, n - 1);
-        const list1 = list;
-        const list2 = try allocator.alloc(u32, list1.len);
+
         for (0..iterations) |i| {
-            initList(list1);
-            initList(list2);
+            initList(lists[0]);
+            initList(lists[1]);
             generatePermutationIndices(random, indices_buffer);
             for (0..indices_buffer.len) |j| {
                 const j_conj = indices_buffer.len - 1 - j;
                 // simulate swapping in backward iteration
-                std.mem.swap(u32, &list1[j_conj], &list1[indices_buffer[j_conj]]);
+                std.mem.swap(u32, &lists[0][j_conj], &lists[0][indices_buffer[j_conj]]);
                 // simulate swapping in forward iteration
-                std.mem.swap(u32, &list2[j], &list2[indices_buffer[j]]);
+                std.mem.swap(u32, &lists[1][j], &lists[1][indices_buffer[j]]);
+            }
+            const h: [2]Key = [2]Key{
+                hashPermutation(lists[0], n),
+                hashPermutation(lists[1], n),
+            };
+            const h_res: [2]HashMap(Key, u64).GetOrPutResult = .{
+                try hist[0].getOrPut(h[0]),
+                try hist[1].getOrPut(h[1]),
+            };
+            for (h_res) |e| {
+                if (!e.found_existing) {
+                    e.value_ptr.* = 0;
+                }
+                e.value_ptr.* += 1;
             }
             if (debug_print) {
-                try print(stdout, "{} -> {any}\n", .{ i, list1 });
-                try print(stdout, "{} -> {any}\n", .{ i, list2 });
+                try print(stdout, "{} -> {any}\n", .{ i, lists[0] });
+                try print(stdout, "{} -> {any}\n", .{ i, lists[1] });
             }
+        }
+
+        var suffix: [5:0]u8 = undefined;
+        @memcpy(suffix[1..], ".txt");
+        suffix[5] = 0;
+        for (hist, 0..2) |histogram, i| {
+            suffix[0] = @intCast(i + '0');
+            // here I don't want to create the file just in case.
+            // Q: Is this a useful note?
+            // A:  of course not.
+            const writer = blk: {
+                if (ignore_file)
+                    break :blk stdout;
+
+                const file_name = try std.mem.concat(allocator, u8, &[_][]const u8{ file_prefix, &suffix });
+
+                const file = try std.fs.cwd().createFile(file_name, .{});
+                var f_writer = file.writer(&stdout_buffer); // we shouldn't really need any other buffer since stdout it retired at this point
+                break :blk &f_writer.interface;
+            };
+
+            var it = histogram.iterator();
+            while (it.next()) |entry| {
+                try print(writer, "{d},{d}\n", .{ entry.key_ptr.*, entry.value_ptr.* });
+            }
+            writer.flush() catch {};
         }
     }
     stdout.flush() catch {};
